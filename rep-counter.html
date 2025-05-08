@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bicep Curl Counter - Tim Park</title>
+    <style>
+        body {
+            font-family: 'Tahoma', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #111111;
+            color: white;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 15px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .video-container {
+            position: relative;
+            width: 100%;
+            margin-bottom: 15px;
+        }
+        
+        video {
+            width: 100%;
+            border-radius: 8px;
+            background-color: #000;
+        }
+        
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        
+        .count-display {
+            background-color: white;
+            color: #1a1a2e;
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-around;
+            margin-bottom: 15px;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .count-item {
+            text-align: center;
+        }
+        
+        .count-number {
+            font-size: 36px;
+            color: #e94560;
+        }
+        
+        .reset-button-container {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 15px;
+        }
+        
+        button {
+            background-color: #e94560;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            padding: 12px 24px;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background-color: #cf3f56;
+        }
+        
+        .feedback {
+            position: absolute;
+            bottom: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            background-color: rgba(0, 0, 0, 0.7);
+            padding: 8px 15px;
+            border-radius: 4px;
+            font-size: 16px;
+            color: white;
+            text-align: center;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .feedback.active {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Bicep Curl Counter</h1>
+            <div id="fps">0 FPS</div>
+        </div>
+        
+        <div class="count-display">
+            <div class="count-item">
+                <div id="leftLabel">LEFT ARM</div>
+                <div class="count-number" id="leftCount">0</div>
+            </div>
+            <div class="count-item">
+                <div id="rightLabel">RIGHT ARM</div>
+                <div class="count-number" id="rightCount">0</div>
+            </div>
+        </div>
+        
+        <div class="reset-button-container">
+            <button id="resetBtn">Reset Count</button>
+        </div>
+        
+        <div class="video-container">
+            <video id="video" playsinline></video>
+            <canvas id="canvas"></canvas>
+            <div id="feedback" class="feedback"></div>
+        </div>
+    </div>
+
+            
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+    
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const fpsDisplay = document.getElementById('fps');
+        const leftCountElement = document.getElementById('leftCount');
+        const rightCountElement = document.getElementById('rightCount');
+        const resetBtn = document.getElementById('resetBtn');
+        const feedbackElement = document.getElementById('feedback');
+
+        // App State
+        let detector;
+        let frameCount = 0;
+        let fps = 0;
+        let lastTime = 0;
+        let lastPoseTime = 0;
+        let keypoints = null;
+        let leftCount = 0;
+        let rightCount = 0;
+        let leftAngle = 0;
+        let rightAngle = 0;
+        let leftState = 'down';
+        let rightState = 'down';
+        let minConfidence = 0.5;
+        let lastBeepTime = 0;
+        let feedbackTimeout = null;
+        
+        // Set rep threshold for bicep curl
+        const repAngleThreshold = 40;
+        
+        // Show feedback message
+        function showFeedback(message) {
+            feedbackElement.textContent = message;
+            feedbackElement.classList.add('active');
+            
+            if (feedbackTimeout) {
+                clearTimeout(feedbackTimeout);
+            }
+            
+            feedbackTimeout = setTimeout(() => {
+                feedbackElement.classList.remove('active');
+            }, 2000);
+        }
+        
+        // Reset the counts
+        function resetCounts() {
+            leftCount = 0;
+            rightCount = 0;
+            leftState = 'down';
+            rightState = 'down';
+            updateCountDisplay();
+            showFeedback('Counts reset');
+        }
+        
+        // Update the count display
+        function updateCountDisplay() {
+            leftCountElement.textContent = leftCount;
+            rightCountElement.textContent = rightCount;
+        }
+
+        // Calculate angle between three points
+        function calculateAngle(a, b, c) {
+            if (!a || !b || !c) return 0;
+            
+            let ab = Math.sqrt(Math.pow(b.x - a.x, 2) + Math.pow(b.y - a.y, 2));
+            let bc = Math.sqrt(Math.pow(b.x - c.x, 2) + Math.pow(b.y - c.y, 2));
+            let ac = Math.sqrt(Math.pow(c.x - a.x, 2) + Math.pow(c.y - a.y, 2));
+            
+            let angle = Math.acos((ab*ab + bc*bc - ac*ac) / (2 * ab * bc));
+            return Math.round(angle * (180 / Math.PI));
+        }
+
+        // Check for repetitions for bicep curls
+        function checkForRep(keypoints) {
+            if (!keypoints || keypoints.length < 17) return;
+            
+            // Get keypoints for arms
+            const leftShoulder = keypoints[5];
+            const leftElbow = keypoints[7];
+            const leftWrist = keypoints[9];
+            
+            const rightShoulder = keypoints[6];
+            const rightElbow = keypoints[8];
+            const rightWrist = keypoints[10];
+            
+            // Calculate angles for the bicep curl
+            if (leftShoulder.score > minConfidence && leftElbow.score > minConfidence && leftWrist.score > minConfidence) {
+                leftAngle = calculateAngle(
+                    { x: leftShoulder.x, y: leftShoulder.y },
+                    { x: leftElbow.x, y: leftElbow.y },
+                    { x: leftWrist.x, y: leftWrist.y }
+                );
+                
+                // For bicep curl: Up = arm bent (small angle), Down = arm straight (large angle)
+                if (leftAngle < repAngleThreshold && leftState === 'down') {
+                    leftState = 'up';
+                } else if (leftAngle > repAngleThreshold + 15 && leftState === 'up') {
+                    leftCount++;
+                    leftState = 'down';
+                    updateCountDisplay();
+                }
+            }
+            
+            if (rightShoulder.score > minConfidence && rightElbow.score > minConfidence && rightWrist.score > minConfidence) {
+                rightAngle = calculateAngle(
+                    { x: rightShoulder.x, y: rightShoulder.y },
+                    { x: rightElbow.x, y: rightElbow.y },
+                    { x: rightWrist.x, y: rightWrist.y }
+                );
+                
+                if (rightAngle < repAngleThreshold && rightState === 'down') {
+                    rightState = 'up';
+                } else if (rightAngle > repAngleThreshold + 15 && rightState === 'up') {
+                    rightCount++;
+                    rightState = 'down';
+                    updateCountDisplay();
+                }
+            }
+        }
+
+        // Draw skeleton on canvas - optimized version
+        function drawPose(keypoints) {
+            if (!keypoints) return;
+            
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            // Draw only essential connections for better performance
+            const connections = [
+                [5, 7], [7, 9], // Left arm
+                [6, 8], [8, 10], // Right arm
+                [5, 6], // Shoulders
+                [5, 11], [6, 12], // Upper torso
+            ];
+            
+            // Create paths for all connections first, then stroke them all at once
+            ctx.beginPath();
+            let validConnectionCount = 0;
+            
+            for (let i = 0; i < connections.length; i++) {
+                const [a, b] = connections[i];
+                const keypointA = keypoints[a];
+                const keypointB = keypoints[b];
+                
+                if (keypointA.score >= minConfidence && keypointB.score >= minConfidence) {
+                    ctx.moveTo(keypointA.x, keypointA.y);
+                    ctx.lineTo(keypointB.x, keypointB.y);
+                    validConnectionCount++;
+                }
+            }
+            
+            // Only stroke if we have valid connections
+            if (validConnectionCount > 0) {
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
+            
+            // Draw minimal keypoints (just the ones we need)
+            const criticalJoints = [5, 6, 7, 8, 9, 10]; // Shoulders, elbows, wrists
+            
+            // Batch keypoint drawing for better performance
+            ctx.beginPath();
+            for (let i = 0; i < criticalJoints.length; i++) {
+                const keypoint = keypoints[criticalJoints[i]];
+                if (keypoint.score >= minConfidence) {
+                    ctx.moveTo(keypoint.x + 3, keypoint.y);
+                    ctx.arc(keypoint.x, keypoint.y, 3, 0, 2 * Math.PI);
+                }
+            }
+            ctx.fillStyle = 'aqua';
+            ctx.fill();
+            
+            // Highlight active exercise parts
+            // Simplified arm highlighting
+            const leftShoulder = keypoints[5];
+            const leftElbow = keypoints[7];
+            const leftWrist = keypoints[9];
+            
+            const rightShoulder = keypoints[6];
+            const rightElbow = keypoints[8];
+            const rightWrist = keypoints[10];
+            
+            // Draw highlighted arms with a single path if possible
+            ctx.beginPath();
+            
+            if (leftShoulder.score >= minConfidence && leftElbow.score >= minConfidence && leftWrist.score >= minConfidence) {
+                ctx.moveTo(leftShoulder.x, leftShoulder.y);
+                ctx.lineTo(leftElbow.x, leftElbow.y);
+                ctx.lineTo(leftWrist.x, leftWrist.y);
+            }
+            
+            ctx.strokeStyle = leftState === 'up' ? '#4CAF50' : '#FFC107';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            
+            ctx.beginPath();
+            
+            if (rightShoulder.score >= minConfidence && rightElbow.score >= minConfidence && rightWrist.score >= minConfidence) {
+                ctx.moveTo(rightShoulder.x, rightShoulder.y);
+                ctx.lineTo(rightElbow.x, rightElbow.y);
+                ctx.lineTo(rightWrist.x, rightWrist.y);
+            }
+            
+            ctx.strokeStyle = rightState === 'up' ? '#4CAF50' : '#FFC107';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        }
+
+        async function detectPose() {
+            const now = performance.now();
+            frameCount++;
+            
+            if (now - lastTime >= 1000) {
+                fps = Math.round(frameCount * 1000 / (now - lastTime));
+                frameCount = 0;
+                lastTime = now;
+                fpsDisplay.textContent = `${fps} FPS`;
+            }
+            
+            // Resize canvas to match video dimensions (do this only when needed)
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+            }
+            
+            try {
+                // Throttle pose detection to improve performance
+                // detect poses every 150ms
+                if (now - lastPoseTime > 150) {
+                    const poses = await detector.estimatePoses(video);
+                    
+                    if (poses && poses.length > 0) {
+                        // Save the keypoints for use in future frames
+                        keypoints = poses[0].keypoints;
+                        lastPoseTime = now;
+                        
+                        // Check for repetitions with the new pose data
+                        checkForRep(keypoints);
+                    }
+                }
+                
+                if (keypoints) {
+                    drawPose(keypoints);
+                }
+            } catch (error) {
+                console.error('Error detecting poses:', error);
+            }
+            
+            // Continue detection with requestAnimationFrame for smooth rendering
+            requestAnimationFrame(detectPose);
+        }
+
+        // Initialize the application
+        async function init() {
+            try {
+                // Initialize camera
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        facingMode: 'user',
+                        width: { ideal: 640 }, // Lower resolution
+                        height: { ideal: 480 } // Lower resolution
+                    },
+                    audio: false
+                });
+                
+                video.srcObject = stream;
+                
+                // Wait for video to be ready
+                await new Promise(resolve => {
+                    video.onloadedmetadata = () => {
+                        resolve(video);
+                    };
+                });
+                
+                video.play();
+                
+                // Load lighter model detection
+                const detectorConfig = {
+                    modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING, // Lighter model
+                    enableSmoothing: true,
+                    multiPoseMaxDimension: 256 
+                };
+                
+                detector = await poseDetection.createDetector(
+                    poseDetection.SupportedModels.MoveNet, 
+                    detectorConfig
+                );
+                
+                // Start pose detection
+                detectPose();
+                
+                // Set up event listeners
+                resetBtn.addEventListener('click', resetCounts);
+                
+                showFeedback('Ready! Start doing bicep curls');
+                
+            } catch (error) {
+                console.error('Error initializing:', error);
+                showFeedback('Error initializing camera or model');
+            }
+        }
+
+        // Start the app when document is loaded
+        window.onload = init;
+    </script>
+</body>
+</html>
